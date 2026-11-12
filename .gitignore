@@ -1,0 +1,44 @@
+# Secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Maven build output
+target/
+dependency-reduced-pom.xml
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+release.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# Java
+*.class
+hs_err_pid*.log
+replay_pid*.log
+
+# Logs
+*.log
+logs/
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+bin/
+nbproject/
+.nb-gradle/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
