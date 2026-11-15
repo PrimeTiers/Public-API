@@ -61,17 +61,21 @@ final class FakeApi implements AutoCloseable {
         String path = ex.getRequestURI().getPath();
         String rawQuery = ex.getRequestURI().getRawQuery();
         String query = rawQuery == null ? "" : URLDecoder.decode(rawQuery, StandardCharsets.UTF_8);
-        requests.add(query.isEmpty() ? path : path + "?" + query);
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        String method = ex.getRequestMethod();
+        requests.add((method.equals("GET") ? "" : method + " ") + (query.isEmpty() ? path : path + "?" + query));
         userAgents.add(ex.getRequestHeaders().getFirst("User-Agent"));
 
+        // Routes get the query for GET requests and the body for anything else.
         Function<String, Reply> route = routes.get(path);
-        Reply reply = route == null ? Reply.error(404, "not found") : route.apply(query);
-        byte[] body = reply.body().getBytes(StandardCharsets.UTF_8);
+        Reply reply = route == null ? Reply.error(404, "not found")
+                : route.apply(method.equals("GET") ? query : body);
+        byte[] out = reply.body().getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
         reply.headers().forEach(ex.getResponseHeaders()::set);
-        ex.sendResponseHeaders(reply.status(), body.length);
-        try (OutputStream out = ex.getResponseBody()) {
-            out.write(body);
+        ex.sendResponseHeaders(reply.status(), out.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(out);
         }
     }
 

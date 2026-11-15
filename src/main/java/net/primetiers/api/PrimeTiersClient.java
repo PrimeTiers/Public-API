@@ -11,12 +11,14 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
@@ -24,6 +26,7 @@ import java.util.function.Function;
 import java.util.regex.Pattern;
 
 import com.google.gson.JsonParseException;
+import com.google.gson.reflect.TypeToken;
 
 import net.primetiers.api.internal.Json;
 import net.primetiers.api.internal.ResponseCache;
@@ -63,6 +66,12 @@ import net.primetiers.api.model.RecentTest;
  * per-player cache, so looking up everyone in a tab list and then single players costs no
  * extra requests.
  *
+ * <h2>UUIDs</h2>
+ * PrimeTiers doesn't store UUIDs. {@link #resolveUuid(Player)} and
+ * {@link #resolveUuids(Collection)} look up premium players' UUIDs from Mojang's public
+ * profile API ({@value #DEFAULT_MOJANG_URL}), 10 names per request, cached for
+ * {@link Builder#uuidCacheTtl(Duration) uuidCacheTtl} (default 1 hour).
+ *
  * <h2>Errors</h2>
  * Failed futures complete with {@link PrimeTiersException}. Invalid arguments such as an
  * unknown gamemode slug throw {@link IllegalArgumentException} straight away.
@@ -82,6 +91,14 @@ public final class PrimeTiersClient implements AutoCloseable {
             .orElse("dev");
     private static final String DEFAULT_USER_AGENT = "primetiers-java/" + VERSION;
 
+    /** Default root of Mojang's profile API, used to resolve UUIDs. */
+    public static final String DEFAULT_MOJANG_URL = "https://api.minecraftservices.com";
+
+    /** Most names Mojang's bulk lookup accepts per request. */
+    private static final int MOJANG_BATCH_SIZE = 10;
+    private static final Pattern MOJANG_NAME = Pattern.compile("[A-Za-z0-9_]{1,16}");
+    private static final Type PROFILE_LIST = new TypeToken<List<Wire.MojangProfile>>() { }.getType();
+
     /** Usernames the API accepts: 1-32 letters, digits, {@code _} or {@code .}. */
     private static final Pattern USERNAME = Pattern.compile("[A-Za-z0-9_.]{1,32}");
     private static final Pattern GAMEMODE = Pattern.compile("[A-Za-z0-9-]{1,32}");
@@ -92,6 +109,8 @@ public final class PrimeTiersClient implements AutoCloseable {
     private final HttpClient http;
     private final boolean ownsHttp;
     private final ResponseCache cache;
+    private final URI mojangUri;
+    private final ResponseCache uuidCache;
 
     private PrimeTiersClient(Builder b) {
         String base = b.baseUrl.endsWith("/") ? b.baseUrl.substring(0, b.baseUrl.length() - 1) : b.baseUrl;
@@ -99,6 +118,9 @@ public final class PrimeTiersClient implements AutoCloseable {
         this.userAgent = b.userAgent;
         this.timeout = b.timeout;
         this.cache = new ResponseCache(b.cacheTtl);
+        String mojang = b.mojangUrl.endsWith("/") ? b.mojangUrl.substring(0, b.mojangUrl.length() - 1) : b.mojangUrl;
+        this.mojangUri = URI.create(mojang);
+        this.uuidCache = new ResponseCache(b.uuidCacheTtl);
         if (b.httpClient != null) {
             this.http = b.httpClient;
             this.ownsHttp = false;
@@ -234,6 +256,110 @@ public final class PrimeTiersClient implements AutoCloseable {
         return getPlayers(List.of(usernames));
     }
 
+    // --- UUIDs ---------------------------------------------------------------
+
+    /**
+     * Resolves a premium player's Minecraft UUID through Mojang's profile API.
+     *
+     * <p>The lookup is by username, because PrimeTiers doesn't store UUIDs. If the player
+     * changed their Minecraft name after they were tiered, this gives the UUID of whoever
+     * owns the PrimeTiers name now, or empty if no one does.
+     *
+     * @return the UUID, or empty if the player isn't {@link Player#isPremium() premium} or
+     *         Mojang has no account with that name. Non-premium players send no request.
+     */
+    public CompletableFuture<Optional<UUID>> resolveUuid(Player player) {
+        Objects.requireNonNull(player, "player");
+        return resolveUuids(List.of(player)).thenApply(m -> Optional.ofNullable(m.get(player.username())));
+    }
+
+    /**
+     * Resolves the Minecraft UUIDs of every premium player in {@code players}, e.g.
+     * {@code client.getPlayers(names).thenCompose(b -> client.resolveUuids(b.players()))}.
+     *
+     * <p>Non-premium players are skipped without a request. Names are sent to Mojang 10 per
+     * request, one request at a time, and cached UUIDs aren't requested again. Read
+     * {@link #resolveUuid(Player)} for how renamed players are handled.
+     *
+     * @return UUIDs keyed by {@link Player#username()}, in input order. Players that aren't
+     *         premium or that Mojang doesn't know are left out.
+     */
+    public CompletableFuture<Map<String, UUID>> resolveUuids(Collection<Player> players) {
+        Objects.requireNonNull(players, "players");
+
+        Map<String, String> usernameByLower = new LinkedHashMap<>();
+        Map<String, CompletableFuture<Optional<UUID>>> results = new LinkedHashMap<>();
+        Map<String, CompletableFuture<Optional<UUID>>> toFetch = new LinkedHashMap<>();
+        for (Player p : players) {
+            if (p == null || !p.isPremium()) {
+                continue;
+            }
+            String lower = p.username().toLowerCase(Locale.ROOT);
+            if (results.containsKey(lower)) {
+                continue;
+            }
+            usernameByLower.put(lower, p.username());
+            if (!MOJANG_NAME.matcher(p.username()).matches()) {
+                results.put(lower, CompletableFuture.completedFuture(Optional.empty()));
+                continue;
+            }
+            CompletableFuture<Optional<UUID>> mine = new CompletableFuture<>();
+            CompletableFuture<Optional<UUID>> existing = uuidCache.putIfAbsent("uuid:" + lower, mine);
+            if (existing != null) {
+                results.put(lower, existing);
+            } else {
+                results.put(lower, mine);
+                toFetch.put(lower, mine);
+            }
+        }
+
+        // One request at a time, to stay well inside Mojang's rate limit. If one fails,
+        // the rest fail with the same error rather than sending more requests.
+        List<String> pending = List.copyOf(toFetch.keySet());
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (int i = 0; i < pending.size(); i += MOJANG_BATCH_SIZE) {
+            List<String> chunk = pending.subList(i, Math.min(pending.size(), i + MOJANG_BATCH_SIZE));
+            chain = chain.thenCompose(v -> fetchUuids(chunk, toFetch));
+        }
+        chain.whenComplete((v, error) -> {
+            if (error != null) {
+                Throwable cause = unwrap(error);
+                toFetch.values().forEach(f -> f.completeExceptionally(cause));
+            }
+        });
+
+        return CompletableFuture.allOf(results.values().toArray(CompletableFuture[]::new))
+                .handle((ignored, error) -> {
+                    if (error != null) {
+                        throw new CompletionException(unwrap(error));
+                    }
+                    Map<String, UUID> out = new LinkedHashMap<>();
+                    results.forEach((lower, f) -> f.join().ifPresent(id -> out.put(usernameByLower.get(lower), id)));
+                    return Collections.unmodifiableMap(out);
+                });
+    }
+
+    /** One Mojang bulk request. Completes every future in {@code chunk} on success. */
+    private CompletableFuture<Void> fetchUuids(List<String> chunk,
+            Map<String, CompletableFuture<Optional<UUID>>> futures) {
+        HttpRequest req = baseRequest(mojangUri.resolve("/minecraft/profile/lookup/bulk/byname"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(Json.GSON.toJson(chunk), StandardCharsets.UTF_8))
+                .build();
+        return this.<List<Wire.MojangProfile>>send(req, PROFILE_LIST, "Mojang API").thenAccept(profiles -> {
+            for (Wire.MojangProfile profile : Wire.list(profiles)) {
+                UUID id = Wire.uuid(profile.id());
+                CompletableFuture<Optional<UUID>> f = profile.name() == null ? null
+                        : futures.get(profile.name().toLowerCase(Locale.ROOT));
+                if (f != null && id != null) {
+                    f.complete(Optional.of(id));
+                }
+            }
+            // Names Mojang left out have no account.
+            chunk.forEach(name -> futures.get(name).complete(Optional.empty()));
+        });
+    }
+
     // --- leaderboards --------------------------------------------------------
 
     /** Every gamemode's leaderboard, each sorted HT1 first. */
@@ -333,12 +459,14 @@ public final class PrimeTiersClient implements AutoCloseable {
     /** Forgets every cached result, so the next calls go to the API. */
     public void clearCache() {
         cache.clear();
+        uuidCache.clear();
     }
 
     /** Closes the underlying HTTP client, unless it was supplied through the builder. */
     @Override
     public void close() {
         cache.clear();
+        uuidCache.clear();
         if (ownsHttp) {
             http.close();
         }
@@ -365,12 +493,21 @@ public final class PrimeTiersClient implements AutoCloseable {
 
     /** Sends a GET and parses a 200 response. Any other outcome fails with {@link PrimeTiersException}. */
     private <T> CompletableFuture<T> request(String path, Type type) {
-        HttpRequest req = HttpRequest.newBuilder(baseUri.resolve(path))
-                .GET()
+        return send(baseRequest(baseUri.resolve(path)).GET().build(), type, path);
+    }
+
+    private HttpRequest.Builder baseRequest(URI uri) {
+        return HttpRequest.newBuilder(uri)
                 .timeout(timeout)
                 .header("Accept", "application/json")
-                .header("User-Agent", userAgent)
-                .build();
+                .header("User-Agent", userAgent);
+    }
+
+    /**
+     * Sends a request and parses a 200 response. Any other outcome fails with
+     * {@link PrimeTiersException}. {@code label} names the request in error messages.
+     */
+    private <T> CompletableFuture<T> send(HttpRequest req, Type type, String label) {
         CompletableFuture<HttpResponse<String>> sent;
         try {
             sent = http.sendAsync(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
@@ -381,29 +518,30 @@ public final class PrimeTiersClient implements AutoCloseable {
             if (error != null) {
                 Throwable cause = unwrap(error);
                 String what = cause instanceof IOException ? "network error" : "request failed";
-                throw new PrimeTiersException(0, what + ": " + cause, null, cause);
+                throw new PrimeTiersException(0, label + ": " + what + ": " + cause, null, cause);
             }
             if (resp.statusCode() != 200) {
-                throw httpError(resp);
+                throw httpError(resp, label);
             }
             try {
                 T body = Json.GSON.fromJson(resp.body(), type);
                 if (body == null) {
-                    throw new PrimeTiersException(0, "empty response from " + path, null, null);
+                    throw new PrimeTiersException(0, "empty response from " + label, null, null);
                 }
                 return body;
             } catch (JsonParseException e) {
-                throw new PrimeTiersException(0, "unreadable response from " + path, null, e);
+                throw new PrimeTiersException(0, "unreadable response from " + label, null, e);
             }
         });
     }
 
-    private static PrimeTiersException httpError(HttpResponse<String> resp) {
-        String message = "HTTP " + resp.statusCode();
+    private static PrimeTiersException httpError(HttpResponse<String> resp, String label) {
+        String message = label + ": HTTP " + resp.statusCode();
         try {
             Wire.Error err = Json.GSON.fromJson(resp.body(), Wire.Error.class);
-            if (err != null && err.error() != null) {
-                message = message + ": " + err.error();
+            String detail = err == null ? null : err.errorMessage() != null ? err.errorMessage() : err.error();
+            if (detail != null) {
+                message = message + ": " + detail;
             }
         } catch (JsonParseException ignored) {
             // keep the status-only message
@@ -435,6 +573,8 @@ public final class PrimeTiersClient implements AutoCloseable {
         private String userAgent = DEFAULT_USER_AGENT;
         private Duration timeout = Duration.ofSeconds(10);
         private Duration cacheTtl = Duration.ofMinutes(5);
+        private String mojangUrl = DEFAULT_MOJANG_URL;
+        private Duration uuidCacheTtl = Duration.ofHours(1);
         private Executor executor;
         private HttpClient httpClient;
 
@@ -473,6 +613,24 @@ public final class PrimeTiersClient implements AutoCloseable {
                 throw new IllegalArgumentException("cacheTtl must not be negative");
             }
             this.cacheTtl = cacheTtl;
+            return this;
+        }
+
+        /** Root of Mojang's profile API. Defaults to {@value PrimeTiersClient#DEFAULT_MOJANG_URL}; change it only for testing. */
+        public Builder mojangUrl(String mojangUrl) {
+            this.mojangUrl = Objects.requireNonNull(mojangUrl, "mojangUrl");
+            return this;
+        }
+
+        /**
+         * How long resolved UUIDs (and "no such account" results) are cached. Default 1 hour.
+         * {@link Duration#ZERO} disables caching.
+         */
+        public Builder uuidCacheTtl(Duration uuidCacheTtl) {
+            if (uuidCacheTtl.isNegative()) {
+                throw new IllegalArgumentException("uuidCacheTtl must not be negative");
+            }
+            this.uuidCacheTtl = uuidCacheTtl;
             return this;
         }
 

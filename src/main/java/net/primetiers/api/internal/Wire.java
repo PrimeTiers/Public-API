@@ -13,7 +13,8 @@ public final class Wire {
     private Wire() {
     }
 
-    public record Error(String error) {
+    /** PrimeTiers sends {@code error}; Mojang sends {@code errorMessage}. */
+    public record Error(String error, String errorMessage) {
     }
 
     public record Health(boolean ok) {
@@ -32,6 +33,27 @@ public final class Wire {
     }
 
     public record RecentTests(List<RecentTest> items) {
+    }
+
+    /** A Mojang profile: {@code id} is the UUID without dashes, {@code name} the current username. */
+    public record MojangProfile(String id, String name) {
+    }
+
+    /** Parses a UUID with or without dashes. Returns null if malformed. */
+    public static java.util.UUID uuid(String id) {
+        if (id == null) {
+            return null;
+        }
+        String s = id.trim();
+        if (s.length() == 32) {
+            s = s.substring(0, 8) + "-" + s.substring(8, 12) + "-" + s.substring(12, 16) + "-"
+                    + s.substring(16, 20) + "-" + s.substring(20);
+        }
+        try {
+            return java.util.UUID.fromString(s);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     /** Null-safe, null-free copy of a list from a response. */

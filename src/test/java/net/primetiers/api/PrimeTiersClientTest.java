@@ -234,6 +234,14 @@ class PrimeTiersClientTest {
     }
 
     @Test
+    void isPremium() {
+        assertTrue(new Player(1, "a", null, "premium", List.of()).isPremium());
+        assertTrue(new Player(1, "a", null, "PREMIUM", List.of()).isPremium());
+        assertFalse(new Player(1, "a", null, "cracked", List.of()).isPremium());
+        assertFalse(new Player(1, "a", null, null, List.of()).isPremium());
+    }
+
+    @Test
     void tierAndGamemodeHelpers() {
         assertTrue(Tier.HT1.isBetterThan(Tier.LT1));
         assertEquals(3, Tier.LT3.level());

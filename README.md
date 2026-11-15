@@ -6,6 +6,7 @@ A Java library for reading PrimeTiers data (player tiers, leaderboards and recen
 - Async: every call returns a `CompletableFuture` and never blocks your game thread
 - Caches results in memory and shares in-flight requests, so lookups for a whole tab list cost few requests
 - Batch lookups of any size (split into requests of 50 names automatically)
+- Resolves premium players to their Minecraft UUIDs (through Mojang's public API)
 - One dependency: Gson 2.11, which Minecraft already ships
 
 ## Install
@@ -85,6 +86,8 @@ Use `.join()` only off the game thread, e.g. in a bot or command-line tool.
 | `getGamemodeTiers(gamemode[, limit])` | `List<GamemodeTierEntry>`, newest first, limit 1-100 (default 50) | `GET /api/gamemodes/{gamemode}/tiers` |
 | `getRecentTests()` / `(limit)` | `List<RecentTest>`, newest first, limit 1-100 (default 20) | `GET /api/recent` |
 | `getGamemodes()` | `List<String>` of active gamemode slugs | `GET /api/gamemodes` |
+| `resolveUuid(Player)` | `Optional<UUID>`; empty if not premium or no Mojang account | Mojang `POST /minecraft/profile/lookup/bulk/byname` |
+| `resolveUuids(Collection<Player>)` | `Map<String, UUID>` keyed by username; non-premium players left out | Mojang, 10 names per request |
 | `isHealthy()` | `Boolean`; never fails | `GET /api/health` |
 | `clearCache()` | Drops all cached results | none |
 
@@ -110,6 +113,14 @@ primeTiers.getLeaderboard(Gamemode.CRYSTAL).thenAccept(board ->
                 System.out.println("#" + e.rank() + " " + e.username() + " " + e.tier())));
 ```
 
+Get UUIDs for premium players (for example, to match tiers to online players by UUID):
+
+```java
+primeTiers.getPlayers(names)
+        .thenCompose(batch -> primeTiers.resolveUuids(batch.players()))
+        .thenAccept(uuids -> uuids.forEach((name, uuid) -> System.out.println(name + " = " + uuid)));
+```
+
 Compare tiers:
 
 ```java
@@ -128,6 +139,15 @@ All types are immutable records in `net.primetiers.api.model`.
 - **`Tier`**: `HT1`, `LT1`, `HT2`, … `LT5`, best first. `rank()`, `level()`, `isHigh()`, `isBetterThan()`, `Tier.parse()`.
 - **`Gamemode`**: `CRYSTAL`, `AXE`, `SWORD`, `MACE`, `MACE_SPEAR` (`mace-spear`), `NETHERITE_OP` (`nethertite`), `POT`, `SMP`, `UHC`, `CART`. `slug()`, `Gamemode.fromSlug()`.
 - Gamemodes in responses are strings, so a gamemode added later still shows up. A `Tier` field is `null` only if the API sends a tier this library version doesn't know.
+
+## UUIDs
+
+PrimeTiers doesn't store UUIDs, so `resolveUuid` / `resolveUuids` look them up by username from Mojang's public profile API (`api.minecraftservices.com`):
+
+- Only players with `platform` `premium` (`Player.isPremium()`) are resolved. Cracked players have no Mojang UUID; they return empty and send no request.
+- Names go 10 per request, one request at a time. Results, including "no such account", are cached for 1 hour (`uuidCacheTtl`). Mojang rate-limits this API, so keep the cache on and resolve in batches.
+- **Renamed players:** the lookup uses the PrimeTiers username. If a player changed their Minecraft name after being tiered, you get empty, or the UUID of whoever owns that name now.
+- Mojang failures surface as `PrimeTiersException`, with messages starting `Mojang API:`. `isRateLimited()` and `retryAfter()` work the same way as for PrimeTiers errors.
 
 ## Errors
 
@@ -154,6 +174,7 @@ primeTiers.getRecentTests().exceptionally(e -> {
 PrimeTiersClient.builder()
         .userAgent("MyMod/1.0.0")            // sent as "MyMod/1.0.0 primetiers-java/<version>"
         .cacheTtl(Duration.ofMinutes(5))     // default 5 min; Duration.ZERO disables caching
+        .uuidCacheTtl(Duration.ofHours(1))   // how long resolved UUIDs are kept
         .timeout(Duration.ofSeconds(10))     // per request
         .executor(myExecutor)                // threads for HTTP and callbacks
         .httpClient(myHttpClient)            // or bring your own java.net.http.HttpClient

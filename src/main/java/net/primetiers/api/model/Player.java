@@ -20,6 +20,15 @@ public record Player(long id, String username, String region, String platform, L
         tiers = tiers == null ? List.of() : tiers.stream().filter(Objects::nonNull).toList();
     }
 
+    /**
+     * {@code true} if PrimeTiers has this player marked as premium (a paid Java Edition
+     * account). Only premium players get a UUID from
+     * {@link net.primetiers.api.PrimeTiersClient#resolveUuid(Player)}.
+     */
+    public boolean isPremium() {
+        return "premium".equalsIgnoreCase(platform);
+    }
+
     /** This player's tier in one gamemode, if they have one. */
     public Optional<PlayerTier> tier(Gamemode gamemode) {
         return tier(gamemode.slug());
