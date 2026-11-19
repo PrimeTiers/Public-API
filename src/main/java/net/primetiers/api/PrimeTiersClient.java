@@ -22,6 +22,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
@@ -58,9 +59,15 @@ import net.primetiers.api.model.RecentTest;
  * threads. Move back to your own thread before touching game state, e.g.
  * {@code future.thenAcceptAsync(action, minecraftClient::execute)}.
  *
+ * <h2>Batching</h2>
+ * Every player lookup uses the batch endpoint ({@code /api/players?names=}).
+ * {@link #getPlayer(String)} calls made within {@link Builder#batchWindow(Duration)
+ * batchWindow} (default 50 ms) of each other go out as one request, so looking up players
+ * one at a time as they join costs few requests.
+ *
  * <h2>Caching</h2>
- * Results are cached in memory for {@link Builder#cacheTtl(Duration) cacheTtl} (default 5
- * minutes, which matches the server's own cache, so fresher data isn't available anyway).
+ * Results are cached in memory for {@link Builder#cacheTtl(Duration) cacheTtl} (default 1
+ * minute, which is how often the server refreshes, so fresher data isn't available anyway).
  * Concurrent identical requests share one HTTP call. "Not found" results are cached too;
  * errors are not. {@link #getPlayer(String)} and {@link #getPlayers(Collection)} share one
  * per-player cache, so looking up everyone in a tab list and then single players costs no
@@ -81,7 +88,7 @@ import net.primetiers.api.model.RecentTest;
 public final class PrimeTiersClient implements AutoCloseable {
 
     /** The production API. */
-    public static final String DEFAULT_BASE_URL = "https://api.primetiers.net";
+    public static final String DEFAULT_BASE_URL = "https://primetiers.net";
 
     /** Most names the API accepts in one batch request. Larger batches are split automatically. */
     public static final int MAX_BATCH_SIZE = 50;
@@ -111,6 +118,10 @@ public final class PrimeTiersClient implements AutoCloseable {
     private final ResponseCache cache;
     private final URI mojangUri;
     private final ResponseCache uuidCache;
+    private final Duration batchWindow;
+    private final Executor batchTimer;
+    /** Single-player lookups waiting to be sent as one batch, by lowercased name. Guarded by itself. */
+    private final Map<String, CompletableFuture<Optional<Player>>> queue = new LinkedHashMap<>();
 
     private PrimeTiersClient(Builder b) {
         String base = b.baseUrl.endsWith("/") ? b.baseUrl.substring(0, b.baseUrl.length() - 1) : b.baseUrl;
@@ -121,6 +132,11 @@ public final class PrimeTiersClient implements AutoCloseable {
         String mojang = b.mojangUrl.endsWith("/") ? b.mojangUrl.substring(0, b.mojangUrl.length() - 1) : b.mojangUrl;
         this.mojangUri = URI.create(mojang);
         this.uuidCache = new ResponseCache(b.uuidCacheTtl);
+        this.batchWindow = b.batchWindow;
+        long windowNanos = b.batchWindow.toNanos();
+        this.batchTimer = b.executor != null
+                ? CompletableFuture.delayedExecutor(windowNanos, TimeUnit.NANOSECONDS, b.executor)
+                : CompletableFuture.delayedExecutor(windowNanos, TimeUnit.NANOSECONDS);
         if (b.httpClient != null) {
             this.http = b.httpClient;
             this.ownsHttp = false;
@@ -160,14 +176,13 @@ public final class PrimeTiersClient implements AutoCloseable {
             return CompletableFuture.completedFuture(Optional.empty());
         }
         String lower = name.toLowerCase(Locale.ROOT);
-        return cache.get(playerKey(lower), () -> this.<Player>request("/api/players/" + lower, Player.class)
-                .thenApply(Optional::ofNullable)
-                .exceptionallyCompose(e -> {
-                    if (unwrap(e) instanceof PrimeTiersException pe && pe.status() == 404) {
-                        return CompletableFuture.completedFuture(Optional.empty());
-                    }
-                    return CompletableFuture.failedFuture(unwrap(e));
-                }));
+        CompletableFuture<Optional<Player>> mine = new CompletableFuture<>();
+        CompletableFuture<Optional<Player>> existing = cache.putIfAbsent(playerKey(lower), mine);
+        if (existing != null) {
+            return existing;
+        }
+        enqueue(Map.of(lower, mine), false);
+        return mine;
     }
 
     /**
@@ -177,7 +192,8 @@ public final class PrimeTiersClient implements AutoCloseable {
      * <p>Names are matched ignoring case, and duplicates are removed. Any number of names
      * is allowed: they are sent {@value #MAX_BATCH_SIZE} per request, and players already
      * in the cache aren't requested again. Invalid names go straight to
-     * {@link PlayerBatch#missing()}.
+     * {@link PlayerBatch#missing()}. Single lookups still waiting for their
+     * {@link Builder#batchWindow(Duration) batch window} are sent along with this batch.
      *
      * @return found players in request order, plus the (lowercased) names not found
      */
@@ -210,34 +226,7 @@ public final class PrimeTiersClient implements AutoCloseable {
             }
         }
 
-        List<String> pending = List.copyOf(toFetch.keySet());
-        for (int i = 0; i < pending.size(); i += MAX_BATCH_SIZE) {
-            List<String> chunk = pending.subList(i, Math.min(pending.size(), i + MAX_BATCH_SIZE));
-            String query = URLEncoder.encode(String.join(",", chunk), StandardCharsets.UTF_8);
-            this.<Wire.PlayerBatch>request("/api/players?names=" + query, Wire.PlayerBatch.class)
-                    .whenComplete((batch, error) -> {
-                        for (String name : chunk) {
-                            CompletableFuture<Optional<Player>> f = toFetch.get(name);
-                            if (error != null) {
-                                f.completeExceptionally(unwrap(error));
-                            }
-                        }
-                        if (error != null) {
-                            return;
-                        }
-                        for (Player p : Wire.list(batch.items())) {
-                            CompletableFuture<Optional<Player>> f =
-                                    toFetch.get(p.username().toLowerCase(Locale.ROOT));
-                            if (f != null) {
-                                f.complete(Optional.of(p));
-                            }
-                        }
-                        // Everything else in the chunk was not found.
-                        for (String name : chunk) {
-                            toFetch.get(name).complete(Optional.empty());
-                        }
-                    });
-        }
+        enqueue(toFetch, true);
 
         return CompletableFuture.allOf(results.values().toArray(CompletableFuture[]::new))
                 .handle((ignored, error) -> {
@@ -254,6 +243,70 @@ public final class PrimeTiersClient implements AutoCloseable {
     /** {@link #getPlayers(Collection)} for a few names. */
     public CompletableFuture<PlayerBatch> getPlayers(String... usernames) {
         return getPlayers(List.of(usernames));
+    }
+
+    /**
+     * Queues player lookups (lowercased name to the future to complete) for the batch
+     * endpoint. With {@code now}, or once a full batch is waiting, the whole queue is sent
+     * straight away; otherwise it is sent when the batch window ends. While the queue is
+     * not empty, a send is always scheduled.
+     */
+    private void enqueue(Map<String, CompletableFuture<Optional<Player>>> lookups, boolean now) {
+        boolean scheduleFlush = false;
+        boolean flushNow;
+        synchronized (queue) {
+            boolean wasEmpty = queue.isEmpty();
+            queue.putAll(lookups);
+            if (queue.isEmpty()) {
+                return;
+            }
+            flushNow = now || batchWindow.isZero() || queue.size() >= MAX_BATCH_SIZE;
+            if (!flushNow && wasEmpty) {
+                scheduleFlush = true;
+            }
+        }
+        if (flushNow) {
+            flushQueue();
+        } else if (scheduleFlush) {
+            batchTimer.execute(this::flushQueue);
+        }
+    }
+
+    /** Sends everything queued, {@value #MAX_BATCH_SIZE} names per request. */
+    private void flushQueue() {
+        List<Map.Entry<String, CompletableFuture<Optional<Player>>>> drained;
+        synchronized (queue) {
+            drained = List.copyOf(queue.entrySet());
+            queue.clear();
+        }
+        for (int i = 0; i < drained.size(); i += MAX_BATCH_SIZE) {
+            Map<String, CompletableFuture<Optional<Player>>> chunk = new LinkedHashMap<>();
+            drained.subList(i, Math.min(drained.size(), i + MAX_BATCH_SIZE))
+                    .forEach(e -> chunk.put(e.getKey(), e.getValue()));
+            fetchPlayers(chunk);
+        }
+    }
+
+    /** One {@code /api/players?names=} request. Completes every future in {@code chunk}. */
+    private void fetchPlayers(Map<String, CompletableFuture<Optional<Player>>> chunk) {
+        String query = URLEncoder.encode(String.join(",", chunk.keySet()), StandardCharsets.UTF_8);
+        this.<Wire.PlayerBatch>request("/api/players?names=" + query, Wire.PlayerBatch.class)
+                .whenComplete((batch, error) -> {
+                    if (error != null) {
+                        Throwable cause = unwrap(error);
+                        chunk.values().forEach(f -> f.completeExceptionally(cause));
+                        return;
+                    }
+                    for (Player p : Wire.list(batch.items())) {
+                        CompletableFuture<Optional<Player>> f = p.username() == null ? null
+                                : chunk.get(p.username().toLowerCase(Locale.ROOT));
+                        if (f != null) {
+                            f.complete(Optional.of(p));
+                        }
+                    }
+                    // Everything else in the chunk was not found.
+                    chunk.values().forEach(f -> f.complete(Optional.empty()));
+                });
     }
 
     // --- UUIDs ---------------------------------------------------------------
@@ -465,6 +518,13 @@ public final class PrimeTiersClient implements AutoCloseable {
     /** Closes the underlying HTTP client, unless it was supplied through the builder. */
     @Override
     public void close() {
+        List<CompletableFuture<Optional<Player>>> unsent;
+        synchronized (queue) {
+            unsent = List.copyOf(queue.values());
+            queue.clear();
+        }
+        PrimeTiersException closed = new PrimeTiersException(0, "client closed", null, null);
+        unsent.forEach(f -> f.completeExceptionally(closed));
         cache.clear();
         uuidCache.clear();
         if (ownsHttp) {
@@ -572,9 +632,10 @@ public final class PrimeTiersClient implements AutoCloseable {
         private String baseUrl = DEFAULT_BASE_URL;
         private String userAgent = DEFAULT_USER_AGENT;
         private Duration timeout = Duration.ofSeconds(10);
-        private Duration cacheTtl = Duration.ofMinutes(5);
+        private Duration cacheTtl = Duration.ofMinutes(1);
         private String mojangUrl = DEFAULT_MOJANG_URL;
         private Duration uuidCacheTtl = Duration.ofHours(1);
+        private Duration batchWindow = Duration.ofMillis(50);
         private Executor executor;
         private HttpClient httpClient;
 
@@ -607,7 +668,10 @@ public final class PrimeTiersClient implements AutoCloseable {
             return this;
         }
 
-        /** How long results are cached. Default 5 minutes. {@link Duration#ZERO} disables caching. */
+        /**
+         * How long results are cached. Default 1 minute, which is how often the server
+         * refreshes its data. {@link Duration#ZERO} disables caching.
+         */
         public Builder cacheTtl(Duration cacheTtl) {
             if (cacheTtl.isNegative()) {
                 throw new IllegalArgumentException("cacheTtl must not be negative");
@@ -631,6 +695,19 @@ public final class PrimeTiersClient implements AutoCloseable {
                 throw new IllegalArgumentException("uuidCacheTtl must not be negative");
             }
             this.uuidCacheTtl = uuidCacheTtl;
+            return this;
+        }
+
+        /**
+         * How long {@link PrimeTiersClient#getPlayer(String)} waits to collect other lookups
+         * into the same batch request. Default 50 ms. {@link Duration#ZERO} sends each
+         * lookup at once (still through the batch endpoint).
+         */
+        public Builder batchWindow(Duration batchWindow) {
+            if (batchWindow.isNegative()) {
+                throw new IllegalArgumentException("batchWindow must not be negative");
+            }
+            this.batchWindow = batchWindow;
             return this;
         }
 

@@ -14,7 +14,7 @@ import java.util.function.Function;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
-/** A local stand-in for api.primetiers.net that serves canned responses and records requests. */
+/** A local stand-in for the PrimeTiers API that serves canned responses and records requests. */
 final class FakeApi implements AutoCloseable {
 
     record Reply(int status, String body, Map<String, String> headers) {

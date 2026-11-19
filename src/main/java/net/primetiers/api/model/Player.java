@@ -12,12 +12,21 @@ import java.util.Optional;
  * @param username username with its stored capitalization
  * @param region   region code such as {@code "NA"}, {@code "EU"} or {@code "AS"}; may be null
  * @param platform e.g. {@code "premium"}; may be null
- * @param tiers    one entry per gamemode the player has a tier in; never null
+ * @param tiers      one entry per gamemode the player has a tier in; never null
+ * @param rank       position on the global (points) leaderboard, starting at 1; 0 if unknown
+ * @param points     total points across all gamemodes
+ * @param combatRank combat rank title from the points, e.g. {@code "Combat Ace"}; may be null
  */
-public record Player(long id, String username, String region, String platform, List<PlayerTier> tiers) {
+public record Player(long id, String username, String region, String platform, List<PlayerTier> tiers,
+        int rank, int points, String combatRank) {
 
     public Player {
         tiers = tiers == null ? List.of() : tiers.stream().filter(Objects::nonNull).toList();
+    }
+
+    /** A player without global rank, points or combat rank. */
+    public Player(long id, String username, String region, String platform, List<PlayerTier> tiers) {
+        this(id, username, region, platform, tiers, 0, 0, null);
     }
 
     /**

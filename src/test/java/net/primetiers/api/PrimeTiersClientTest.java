@@ -33,10 +33,28 @@ import net.primetiers.api.model.Tier;
 class PrimeTiersClientTest {
 
     private static final String BURNET = """
-            {"id":1,"username":"Burnet01","region":"NA","platform":"premium","tiers":[
+            {"id":1,"username":"Burnet01","region":"NA","platform":"premium","rank":7,"points":36,
+             "combatRank":"Combat Specialist","tiers":[
               {"gamemode":"mace-spear","tier":"HT3","updatedAt":"2025-03-01T00:00:00Z"},
               {"gamemode":"crystal","tier":"LT2","updatedAt":"2025-02-01 12:30:00+00"},
               {"gamemode":"newmode","tier":"XT9","updatedAt":"garbage"}]}""";
+
+    /** Fake batch endpoint: every name ending in an even number exists. */
+    private static final java.util.function.Function<String, Reply> FAKE_BATCH = query -> {
+        List<String> names = Arrays.asList(query.substring("names=".length()).split(","));
+        assertTrue(names.size() <= PrimeTiersClient.MAX_BATCH_SIZE);
+        List<String> items = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        for (String n : names) {
+            if (Integer.parseInt(n.substring(1)) % 2 == 0) {
+                items.add("{\"id\":" + n.substring(1) + ",\"username\":\"" + n.toUpperCase() + "\",\"tiers\":[]}");
+            } else {
+                missing.add("\"" + n + "\"");
+            }
+        }
+        return Reply.ok("{\"count\":" + items.size() + ",\"items\":[" + String.join(",", items)
+                + "],\"missing\":[" + String.join(",", missing) + "]}");
+    };
 
     private FakeApi api;
     private PrimeTiersClient client;
@@ -55,10 +73,14 @@ class PrimeTiersClientTest {
 
     @Test
     void getPlayerParsesAndCaches() {
-        api.on("/api/players/burnet01", Reply.ok(BURNET));
+        api.on("/api/players", Reply.ok("{\"count\":1,\"items\":[" + BURNET + "],\"missing\":[]}"));
 
         Player p = client.getPlayer("Burnet01").join().orElseThrow();
+        assertEquals("/api/players?names=burnet01", api.requests.getFirst(), "single lookups use the batch endpoint");
         assertEquals("Burnet01", p.username());
+        assertEquals(7, p.rank());
+        assertEquals(36, p.points());
+        assertEquals("Combat Specialist", p.combatRank());
         assertEquals(Tier.HT3, p.tier(Gamemode.MACE_SPEAR).orElseThrow().tier());
         assertEquals(Instant.parse("2025-02-01T12:30:00Z"), p.tier("crystal").orElseThrow().updatedAt());
         assertEquals(Tier.LT2, p.bestTier().orElseThrow().tier());
@@ -68,16 +90,59 @@ class PrimeTiersClientTest {
         assertNull(p.tier("newmode").orElseThrow().updatedAt());
 
         client.getPlayer("BURNET01").join();
-        assertEquals(1, api.count("/api/players/"), "second lookup must come from the cache");
+        assertEquals(1, api.count("/api/players"), "second lookup must come from the cache");
         assertTrue(api.userAgents.getFirst().startsWith("TestMod/1.0 primetiers-java/"));
     }
 
     @Test
     void missingPlayerIsEmptyAndCached() {
-        api.on("/api/players/nobody", Reply.error(404, "player not found"));
+        api.on("/api/players", Reply.ok("{\"count\":0,\"items\":[],\"missing\":[\"nobody\"]}"));
         assertTrue(client.getPlayer("nobody").join().isEmpty());
         assertTrue(client.getPlayer("nobody").join().isEmpty());
-        assertEquals(1, api.count("/api/players/nobody"));
+        assertEquals(1, api.count("/api/players"));
+    }
+
+    @Test
+    void singleLookupsAreBatchedTogether() {
+        api.on("/api/players", FAKE_BATCH);
+
+        List<java.util.concurrent.CompletableFuture<java.util.Optional<Player>>> futures = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            futures.add(client.getPlayer("p" + i));
+        }
+        futures.add(client.getPlayer("P2")); // same player, shares the lookup
+        futures.forEach(java.util.concurrent.CompletableFuture::join);
+
+        assertEquals(List.of("/api/players?names=p0,p1,p2,p3,p4,p5,p6,p7,p8,p9"), api.requests);
+        assertEquals("P2", futures.get(2).join().orElseThrow().username());
+        assertTrue(futures.get(3).join().isEmpty());
+        assertTrue(futures.get(10).join().isPresent());
+    }
+
+    @Test
+    void fullBatchIsSentWithoutWaiting() {
+        api.on("/api/players", FAKE_BATCH);
+        try (PrimeTiersClient slow = PrimeTiersClient.builder()
+                .baseUrl(api.baseUrl()).batchWindow(Duration.ofHours(1)).build()) {
+            List<java.util.concurrent.CompletableFuture<java.util.Optional<Player>>> futures = new ArrayList<>();
+            for (int i = 0; i < PrimeTiersClient.MAX_BATCH_SIZE; i++) {
+                futures.add(slow.getPlayer("p" + i));
+            }
+            futures.forEach(java.util.concurrent.CompletableFuture::join);
+            assertEquals(1, api.count("/api/players?"));
+
+            // A waiting single lookup rides along with the next getPlayers call.
+            var waiting = slow.getPlayer("p100");
+            slow.getPlayers("p102").join();
+            assertTrue(waiting.join().isPresent());
+            assertEquals("/api/players?names=p100,p102", api.requests.getLast());
+
+            // Closing fails lookups that were never sent.
+            var unsent = slow.getPlayer("p200");
+            slow.close();
+            CompletionException e = assertThrows(CompletionException.class, unsent::join);
+            assertInstanceOf(PrimeTiersException.class, e.getCause());
+        }
     }
 
     @Test
@@ -90,21 +155,7 @@ class PrimeTiersClientTest {
     @Test
     void batchSplitsDedupesAndKeepsOrder() {
         // Server: every name ending in an even number exists.
-        api.on("/api/players", query -> {
-            List<String> names = Arrays.asList(query.substring("names=".length()).split(","));
-            assertTrue(names.size() <= PrimeTiersClient.MAX_BATCH_SIZE);
-            List<String> items = new ArrayList<>();
-            List<String> missing = new ArrayList<>();
-            for (String n : names) {
-                if (Integer.parseInt(n.substring(1)) % 2 == 0) {
-                    items.add("{\"id\":" + n.substring(1) + ",\"username\":\"" + n.toUpperCase() + "\",\"tiers\":[]}");
-                } else {
-                    missing.add("\"" + n + "\"");
-                }
-            }
-            return Reply.ok("{\"count\":" + items.size() + ",\"items\":[" + String.join(",", items)
-                    + "],\"missing\":[" + String.join(",", missing) + "]}");
-        });
+        api.on("/api/players", FAKE_BATCH);
 
         List<String> names = new ArrayList<>(IntStream.range(0, 60).mapToObj(i -> "p" + i).toList());
         names.add("P0");          // duplicate, different case

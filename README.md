@@ -1,11 +1,11 @@
 # PrimeTiers API for Java
 
-A Java library for reading PrimeTiers data (player tiers, leaderboards and recent tests) in your mods, plugins, bots and tools. It calls the public API at **https://api.primetiers.net** over HTTPS and needs no API key or database access.
+A Java library for reading PrimeTiers data (player tiers, leaderboards and recent tests) in your mods, plugins, bots and tools. It calls the public API on the PrimeTiers website, **https://primetiers.net**, over HTTPS and needs no API key or database access.
 
 - Java 25, Maven
 - Async: every call returns a `CompletableFuture` and never blocks your game thread
 - Caches results in memory and shares in-flight requests, so lookups for a whole tab list cost few requests
-- Batch lookups of any size (split into requests of 50 names automatically)
+- Every player lookup uses the batch endpoint: single lookups made close together share one request, and batches of any size are split into requests of 50 names
 - Resolves premium players to their Minecraft UUIDs (through Mojang's public API)
 - One dependency: Gson 2.11, which Minecraft already ships
 
@@ -78,7 +78,7 @@ Use `.join()` only off the game thread, e.g. in a bot or command-line tool.
 
 | Method | Returns | Endpoint |
 |---|---|---|
-| `getPlayer(username)` | `Optional<Player>`; empty if not on PrimeTiers | `GET /api/players/{username}` |
+| `getPlayer(username)` | `Optional<Player>`; empty if not on PrimeTiers | `GET /api/players?names=` (batched with other lookups) |
 | `getPlayers(names...)` / `getPlayers(Collection)` | `PlayerBatch` (`players()`, `missing()`) | `GET /api/players?names=` |
 | `getLeaderboard()` | `Leaderboard` for every gamemode | `GET /api/leaderboard` |
 | `getLeaderboard(Gamemode)` / `getLeaderboard(String)` | `List<LeaderboardEntry>`, HT1 first | `GET /api/leaderboard?gamemode=` |
@@ -134,7 +134,8 @@ tier.isHigh();  // HT vs LT
 
 All types are immutable records in `net.primetiers.api.model`.
 
-- **`Player`**: `id`, `username`, `region` (`NA`/`EU`/`AS`…, nullable), `platform` (nullable), `tiers`. Helpers: `tier(Gamemode)`, `tier(String)`, `bestTier()`.
+- **`Player`**: `id`, `username`, `region` (`NA`/`EU`/`AS`…, nullable), `platform` (nullable), `tiers`, `rank` (global position), `points`, `combatRank` (e.g. `"Combat Ace"`). Helpers: `tier(Gamemode)`, `tier(String)`, `bestTier()`, `isPremium()`.
+- **`GlobalEntry`**: `rank`, `username`, `region`, `points`, `tiers`, `platform`, `combatRank`.
 - **`PlayerTier`**: `gamemode` (slug), `tier`, `updatedAt` (`Instant`).
 - **`Tier`**: `HT1`, `LT1`, `HT2`, … `LT5`, best first. `rank()`, `level()`, `isHigh()`, `isBetterThan()`, `Tier.parse()`.
 - **`Gamemode`**: `CRYSTAL`, `AXE`, `SWORD`, `MACE`, `MACE_SPEAR` (`mace-spear`), `NETHERITE_OP` (`nethertite`), `POT`, `SMP`, `UHC`, `CART`. `slug()`, `Gamemode.fromSlug()`.
@@ -173,12 +174,13 @@ primeTiers.getRecentTests().exceptionally(e -> {
 ```java
 PrimeTiersClient.builder()
         .userAgent("MyMod/1.0.0")            // sent as "MyMod/1.0.0 primetiers-java/<version>"
-        .cacheTtl(Duration.ofMinutes(5))     // default 5 min; Duration.ZERO disables caching
+        .cacheTtl(Duration.ofMinutes(1))     // default 1 min; Duration.ZERO disables caching
+        .batchWindow(Duration.ofMillis(50))  // how long getPlayer waits to batch with other lookups
         .uuidCacheTtl(Duration.ofHours(1))   // how long resolved UUIDs are kept
         .timeout(Duration.ofSeconds(10))     // per request
         .executor(myExecutor)                // threads for HTTP and callbacks
         .httpClient(myHttpClient)            // or bring your own java.net.http.HttpClient
-        .baseUrl("https://api.primetiers.net")
+        .baseUrl("https://primetiers.net")
         .build();
 ```
 
@@ -186,8 +188,8 @@ Close the client (`close()`, or try-with-resources) when your mod or app shuts d
 
 ## Fair use
 
-- The API caches responses for 5 minutes, so polling faster gets you no fresher data. Keep the default cache.
-- Use `getPlayers` for groups of players instead of many `getPlayer` calls.
+- The server refreshes its data every minute, so polling faster gets you no fresher data. Keep the default cache.
+- Use `getPlayers` for groups of players you already know. Separate `getPlayer` calls are batched too, but only if they come within `batchWindow` of each other.
 - The API rate-limits clients that send too many requests (HTTP 429). Back off for `retryAfter()`.
 - Set `userAgent` so the PrimeTiers team can tell which project is sending traffic.
 
@@ -211,13 +213,13 @@ src/main/java/net/primetiers/api/
   model/                       Response records, Tier and Gamemode enums
   internal/                    JSON parsing, response envelopes, cache (not public API)
 src/test/java/net/primetiers/api/
-  FakeApi.java                 Local stand-in for api.primetiers.net
+  FakeApi.java                 Local stand-in for the PrimeTiers API
   PrimeTiersClientTest.java
 ```
 
 ### Keeping in sync with the server
 
-The server is the Rust Worker in `../API`. When it changes:
+The server is the website in `../Website` (`ApiController`), hosted at https://primetiers.net. When it changes:
 
 - **New gamemode:** add it to `model/Gamemode.java`. Until then it still comes through as a string.
 - **New endpoint:** add a response envelope to `internal/Wire.java` if needed, any new record to `model/`, and a method to `PrimeTiersClient` using `cached(...)`. Then add a test and a row to the table above.
